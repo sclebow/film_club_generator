@@ -12,6 +12,7 @@ import pickle
 TITLE_BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 TITLE_CREW_URL = "https://datasets.imdbws.com/title.crew.tsv.gz"
 NAME_BASICS_URL = "https://datasets.imdbws.com/name.basics.tsv.gz"
+TITLE_RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 
 # Pre-filtered data file
 FILTERED_DATA_FILE = "imdb_movies_directors.pkl"
@@ -48,11 +49,19 @@ def create_filtered_dataset():
     title_basics = download_and_load_imdb_data(TITLE_BASICS_URL, "title.basics.tsv.gz")
     title_crew = download_and_load_imdb_data(TITLE_CREW_URL, "title.crew.tsv.gz")
     name_basics = download_and_load_imdb_data(NAME_BASICS_URL, "name.basics.tsv.gz")
+    title_ratings = download_and_load_imdb_data(TITLE_RATINGS_URL, "title.ratings.tsv.gz")
     
     # Filter for movies only and select needed columns
     movies = title_basics[title_basics['titleType'] == 'movie'][
         ['tconst', 'primaryTitle', 'startYear', 'genres']
     ].copy()
+    
+    # Merge with ratings
+    movies = movies.merge(
+        title_ratings[['tconst', 'averageRating', 'numVotes']],
+        on='tconst',
+        how='left'
+    )
     
     # Merge with crew data
     movies_crew = movies.merge(
@@ -72,12 +81,22 @@ def create_filtered_dataset():
     # Remove whitespace from director IDs
     movies_exploded['director_id'] = movies_exploded['director_id'].str.strip()
     
-    # Count movies per director
-    director_counts = movies_exploded.groupby('director_id', as_index=False).size()
-    director_counts.columns = ['director_id', 'movie_count']
+    # Count movies per director and calculate popularity metrics
+    director_stats = movies_exploded.groupby('director_id').agg({
+        'tconst': 'count',
+        'averageRating': 'mean',
+        'numVotes': 'sum'
+    }).reset_index()
+    director_stats.columns = ['director_id', 'movie_count', 'avg_rating', 'total_votes']
+    
+    # Calculate popularity score (weighted by votes and rating)
+    director_stats['popularity_score'] = (
+        director_stats['avg_rating'].fillna(0) * 
+        director_stats['total_votes'].fillna(0).apply(lambda x: min(x / 1000, 100))
+    )
     
     # Get director info - only for directors who actually directed movies
-    director_ids = set(director_counts['director_id'])
+    director_ids = set(director_stats['director_id'])
     directors_info = name_basics[
         name_basics['nconst'].isin(director_ids)
     ][['nconst', 'primaryName', 'birthYear', 'deathYear', 'primaryProfession']].copy()
@@ -86,14 +105,14 @@ def create_filtered_dataset():
     with open(FILTERED_DATA_FILE, 'wb') as f:
         pickle.dump({
             'movies_exploded': movies_exploded,
-            'director_counts': director_counts,
+            'director_stats': director_stats,
             'directors_info': directors_info,
             'created_at': datetime.now()
         }, f)
     
     st.success(f"Pre-filtered dataset created: {FILTERED_DATA_FILE}")
     
-    return movies_exploded, director_counts, directors_info
+    return movies_exploded, director_stats, directors_info
 
 @st.cache_data(ttl=timedelta(days=7))
 def load_and_process_base_data():
@@ -107,8 +126,15 @@ def load_and_process_base_data():
             with st.spinner("Loading pre-filtered dataset..."):
                 with open(filepath, 'rb') as f:
                     data = pickle.load(f)
+                
+                # Check if pickle has new format with director_stats
+                if 'director_stats' not in data:
+                    st.info("Old data format detected. Re-creating dataset with ratings...")
+                    filepath.unlink()
+                    return create_filtered_dataset()
+                
                 st.success(f"Loaded pre-filtered data (age: {file_age.days} days)")
-                return data['movies_exploded'], data['director_counts'], data['directors_info']
+                return data['movies_exploded'], data['director_stats'], data['directors_info']
         else:
             st.info("Pre-filtered dataset is older than 7 days. Refreshing...")
             filepath.unlink()
@@ -120,10 +146,10 @@ def find_directors_with_n_movies(n_movies=12):
     """Find directors who have directed exactly n movies"""
     
     # Load pre-processed data (cached)
-    movies_exploded, director_counts, directors_info = load_and_process_base_data()
+    movies_exploded, director_stats, directors_info = load_and_process_base_data()
     
     # Filter for exact count
-    directors_with_n = director_counts[director_counts['movie_count'] == n_movies].copy()
+    directors_with_n = director_stats[director_stats['movie_count'] == n_movies].copy()
     
     # Merge with names
     directors_with_names = directors_with_n.merge(
@@ -133,12 +159,15 @@ def find_directors_with_n_movies(n_movies=12):
         how='left'
     )
     
+    # Sort by popularity score (highest first)
+    directors_with_names = directors_with_names.sort_values('popularity_score', ascending=False)
+    
     # Get movies only for these specific directors
     directors_movies = movies_exploded[
         movies_exploded['director_id'].isin(directors_with_n['director_id'])
-    ][['director_id', 'primaryTitle', 'startYear', 'genres', 'tconst']].copy()
+    ][['director_id', 'primaryTitle', 'startYear', 'genres', 'tconst', 'averageRating', 'numVotes']].copy()
     
-    return directors_with_names, directors_movies, director_counts
+    return directors_with_names, directors_movies, director_stats
 
 def main():
     st.set_page_config(page_title="IMDb Directors Analysis", page_icon="🎬", layout="wide")
@@ -173,10 +202,11 @@ def main():
         tab1, tab2, tab3, tab4 = st.tabs(["📋 Directors List", "🎥 Movies by Director", "📊 Distribution", "📈 Statistics"])
         
         with tab1:
-            st.subheader(f"Directors with Exactly {n_movies} Movies")
+            st.subheader(f"Directors with Exactly {n_movies} Movies (Sorted by Popularity)")
             
-            display_df = directors_df[['primaryName', 'birthYear', 'deathYear', 'primaryProfession', 'movie_count']].copy()
-            display_df.columns = ['Name', 'Birth Year', 'Death Year', 'Professions', 'Movie Count']
+            display_df = directors_df[['primaryName', 'avg_rating', 'total_votes', 'birthYear', 'deathYear', 'primaryProfession', 'movie_count']].copy()
+            display_df.columns = ['Name', 'Avg Rating', 'Total Votes', 'Birth Year', 'Death Year', 'Professions', 'Movie Count']
+            display_df['Avg Rating'] = display_df['Avg Rating'].round(1)
             
             st.dataframe(
                 display_df,
@@ -208,9 +238,10 @@ def main():
                 
                 st.write(f"**{selected_director}** directed these {len(director_movies)} movies:")
                 
-                movie_display = director_movies[['primaryTitle', 'startYear', 'genres']].copy()
-                movie_display.columns = ['Title', 'Year', 'Genres']
-                movie_display = movie_display.sort_values('Year')
+                movie_display = director_movies[['primaryTitle', 'startYear', 'averageRating', 'numVotes', 'genres']].copy()
+                movie_display.columns = ['Title', 'Year', 'Rating', 'Votes', 'Genres']
+                movie_display['Rating'] = movie_display['Rating'].round(1)
+                movie_display = movie_display.sort_values('Rating', ascending=False)
                 
                 st.dataframe(movie_display, use_container_width=True)
         
