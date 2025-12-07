@@ -6,11 +6,15 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime, timedelta
 import os
+import pickle
 
 # IMDb dataset URLs
 TITLE_BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 TITLE_CREW_URL = "https://datasets.imdbws.com/title.crew.tsv.gz"
 NAME_BASICS_URL = "https://datasets.imdbws.com/name.basics.tsv.gz"
+
+# Pre-filtered data file
+FILTERED_DATA_FILE = "imdb_movies_directors.pkl"
 
 @st.cache_data(ttl=timedelta(days=7))
 def download_and_load_imdb_data(url, filename):
@@ -36,44 +40,100 @@ def download_and_load_imdb_data(url, filename):
     
     return df
 
-@st.cache_data(ttl=timedelta(days=7))
-def find_directors_with_n_movies(n_movies=12):
-    """Find directors who have directed exactly n movies"""
+def create_filtered_dataset():
+    """Download raw data and create pre-filtered pickle file"""
+    st.info("Creating pre-filtered dataset from IMDb data. This will take several minutes...")
     
-    # Load datasets
+    # Load datasets with only needed columns
     title_basics = download_and_load_imdb_data(TITLE_BASICS_URL, "title.basics.tsv.gz")
     title_crew = download_and_load_imdb_data(TITLE_CREW_URL, "title.crew.tsv.gz")
     name_basics = download_and_load_imdb_data(NAME_BASICS_URL, "name.basics.tsv.gz")
     
-    # Filter for movies only (not TV shows, episodes, etc.)
-    movies = title_basics[title_basics['titleType'] == 'movie'].copy()
+    # Filter for movies only and select needed columns
+    movies = title_basics[title_basics['titleType'] == 'movie'][
+        ['tconst', 'primaryTitle', 'startYear', 'genres']
+    ].copy()
     
-    # Merge with crew data to get directors
-    movies_crew = movies.merge(title_crew[['tconst', 'directors']], on='tconst', how='inner')
+    # Merge with crew data
+    movies_crew = movies.merge(
+        title_crew[['tconst', 'directors']], 
+        on='tconst', 
+        how='inner'
+    )
     
     # Remove entries without directors
     movies_crew = movies_crew[movies_crew['directors'].notna()].copy()
     
-    # Split directors (some movies have multiple directors)
+    # Split directors efficiently
     movies_exploded = movies_crew.assign(
         director_id=movies_crew['directors'].str.split(',')
     ).explode('director_id')
     
+    # Remove whitespace from director IDs
+    movies_exploded['director_id'] = movies_exploded['director_id'].str.strip()
+    
     # Count movies per director
-    director_counts = movies_exploded.groupby('director_id').size().reset_index(name='movie_count')
+    director_counts = movies_exploded.groupby('director_id', as_index=False).size()
+    director_counts.columns = ['director_id', 'movie_count']
     
-    # Filter directors with exactly n movies
-    directors_with_n = director_counts[director_counts['movie_count'] == n_movies]
+    # Get director info - only for directors who actually directed movies
+    director_ids = set(director_counts['director_id'])
+    directors_info = name_basics[
+        name_basics['nconst'].isin(director_ids)
+    ][['nconst', 'primaryName', 'birthYear', 'deathYear', 'primaryProfession']].copy()
     
-    # Get director names
+    # Save to pickle
+    with open(FILTERED_DATA_FILE, 'wb') as f:
+        pickle.dump({
+            'movies_exploded': movies_exploded,
+            'director_counts': director_counts,
+            'directors_info': directors_info,
+            'created_at': datetime.now()
+        }, f)
+    
+    st.success(f"Pre-filtered dataset created: {FILTERED_DATA_FILE}")
+    
+    return movies_exploded, director_counts, directors_info
+
+@st.cache_data(ttl=timedelta(days=7))
+def load_and_process_base_data():
+    """Load pre-filtered data or create it if needed"""
+    filepath = Path(FILTERED_DATA_FILE)
+    
+    # Check if filtered file exists and is fresh
+    if filepath.exists():
+        file_age = datetime.now() - datetime.fromtimestamp(filepath.stat().st_mtime)
+        if file_age <= timedelta(days=7):
+            with st.spinner("Loading pre-filtered dataset..."):
+                with open(filepath, 'rb') as f:
+                    data = pickle.load(f)
+                st.success(f"Loaded pre-filtered data (age: {file_age.days} days)")
+                return data['movies_exploded'], data['director_counts'], data['directors_info']
+        else:
+            st.info("Pre-filtered dataset is older than 7 days. Refreshing...")
+            filepath.unlink()
+    
+    # Create filtered dataset
+    return create_filtered_dataset()
+
+def find_directors_with_n_movies(n_movies=12):
+    """Find directors who have directed exactly n movies"""
+    
+    # Load pre-processed data (cached)
+    movies_exploded, director_counts, directors_info = load_and_process_base_data()
+    
+    # Filter for exact count
+    directors_with_n = director_counts[director_counts['movie_count'] == n_movies].copy()
+    
+    # Merge with names
     directors_with_names = directors_with_n.merge(
-        name_basics[['nconst', 'primaryName', 'birthYear', 'deathYear', 'primaryProfession']],
+        directors_info,
         left_on='director_id',
         right_on='nconst',
         how='left'
     )
     
-    # Get the movies for these directors
+    # Get movies only for these specific directors
     directors_movies = movies_exploded[
         movies_exploded['director_id'].isin(directors_with_n['director_id'])
     ][['director_id', 'primaryTitle', 'startYear', 'genres', 'tconst']].copy()
