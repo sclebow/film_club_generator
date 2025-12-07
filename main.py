@@ -178,7 +178,7 @@ def main():
     st.info("""
     This app analyzes the official IMDb datasets to find directors who have directed exactly 12 movies.
     The first run will download the datasets (~1GB total), which may take a few minutes.
-    Subsequent runs will use cached data.
+    Subsequent runs will use cached data. Cache is refreshed every 7 days.
     """)
     
     # Sidebar controls
