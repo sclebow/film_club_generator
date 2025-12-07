@@ -56,6 +56,14 @@ def create_filtered_dataset():
         ['tconst', 'primaryTitle', 'startYear', 'genres']
     ].copy()
     
+    # Filter out unreleased movies (future years or invalid years)
+    current_year = datetime.now().year
+    movies = movies[
+        (movies['startYear'].notna()) & 
+        (movies['startYear'] != '\\N') &
+        (pd.to_numeric(movies['startYear'], errors='coerce') <= current_year)
+    ].copy()
+    
     # Merge with ratings
     movies = movies.merge(
         title_ratings[['tconst', 'averageRating', 'numVotes']],
@@ -235,6 +243,7 @@ def main():
                 
                 director_id = directors_df[directors_df['primaryName'] == selected_director]['director_id'].iloc[0]
                 director_movies = movies_df[movies_df['director_id'] == director_id].copy()
+                director_movies = director_movies.sort_values('startYear')
                 
                 st.write(f"**{selected_director}** directed these {len(director_movies)} movies:")
                 
@@ -243,7 +252,7 @@ def main():
                 movie_display['Rating'] = movie_display['Rating'].round(1)
                 movie_display = movie_display.sort_values('Rating', ascending=False)
                 
-                st.dataframe(movie_display, use_container_width=True)
+                st.dataframe(movie_display, use_container_width=True, height=465)
         
         with tab3:
             st.subheader("Distribution of Director Movie Counts")
